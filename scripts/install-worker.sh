@@ -23,9 +23,6 @@ validate_env_set() {
 
 validate_env_set BINARY_BUCKET_NAME
 validate_env_set BINARY_BUCKET_REGION
-validate_env_set DOCKER_VERSION
-validate_env_set CONTAINERD_VERSION
-validate_env_set RUNC_VERSION
 validate_env_set CNI_PLUGIN_VERSION
 validate_env_set KUBERNETES_VERSION
 validate_env_set KUBERNETES_BUILD_DATE
@@ -45,137 +42,12 @@ else
     exit 1
 fi
 
-################################################################################
-### Packages ###################################################################
-################################################################################
-
-# Update the OS to begin with to catch up to the latest packages.
-sudo yum update -y
-
-# Install necessary packages
-sudo yum install -y \
-    aws-cfn-bootstrap \
-    awscli \
-    chrony \
-    conntrack \
-    curl \
-    ec2-instance-connect \
-    ipvsadm \
-    jq \
-    nfs-utils \
-    socat \
-    unzip \
-    wget \
-    yum-plugin-versionlock
-
-# Remove the ec2-net-utils package, if it's installed. This package interferes with the route setup on the instance.
-if yum list installed | grep ec2-net-utils; then sudo yum remove ec2-net-utils -y -q; fi
-
-################################################################################
-### Time #######################################################################
-################################################################################
-
-# Make sure Amazon Time Sync Service starts on boot.
-sudo chkconfig chronyd on
-
-# Make sure that chronyd syncs RTC clock to the kernel.
-cat <<EOF | sudo tee -a /etc/chrony.conf
-# This directive enables kernel synchronisation (every 11 minutes) of the
-# real-time clock. Note that it can’t be used along with the 'rtcfile' directive.
-rtcsync
-EOF
-
-# If current clocksource is xen, switch to tsc
-if grep --quiet xen /sys/devices/system/clocksource/clocksource0/current_clocksource &&
-  grep --quiet tsc /sys/devices/system/clocksource/clocksource0/available_clocksource; then
-    echo "tsc" | sudo tee /sys/devices/system/clocksource/clocksource0/current_clocksource
-else
-    echo "tsc as a clock source is not applicable, skipping."
-fi
-
-################################################################################
-### SSH ########################################################################
-################################################################################
-
-# Disable weak ciphers
-echo -e "\nCiphers aes128-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com" | sudo tee -a /etc/ssh/sshd_config
-sudo systemctl restart sshd.service
 
 ################################################################################
 ### iptables ###################################################################
 ################################################################################
 sudo mkdir -p /etc/eks
 sudo mv $TEMPLATE_DIR/iptables-restore.service /etc/eks/iptables-restore.service
-
-################################################################################
-### Docker #####################################################################
-################################################################################
-
-sudo yum install -y yum-utils device-mapper-persistent-data lvm2
-
-INSTALL_DOCKER="${INSTALL_DOCKER:-true}"
-if [[ "$INSTALL_DOCKER" == "true" ]]; then
-    sudo amazon-linux-extras enable docker
-    sudo groupadd -og 1950 docker
-    sudo useradd --gid $(getent group docker | cut -d: -f3) docker
-
-    # install runc and lock version
-    sudo yum install -y runc-${RUNC_VERSION}
-    sudo yum versionlock runc-*
-
-    # install containerd and lock version
-    sudo yum install -y containerd-${CONTAINERD_VERSION}
-    sudo yum versionlock containerd-*
-
-    # install docker and lock version
-    sudo yum install -y docker-${DOCKER_VERSION}*
-    sudo yum versionlock docker-*
-    sudo usermod -aG docker $USER
-
-    # Remove all options from sysconfig docker.
-    sudo sed -i '/OPTIONS/d' /etc/sysconfig/docker
-
-    sudo mkdir -p /etc/docker
-    sudo mv $TEMPLATE_DIR/docker-daemon.json /etc/docker/daemon.json
-    sudo chown root:root /etc/docker/daemon.json
-
-    # Enable docker daemon to start on boot.
-    sudo systemctl daemon-reload
-fi
-
-###############################################################################
-### Containerd setup ##########################################################
-###############################################################################
-
-sudo mkdir -p /etc/eks/containerd
-if [ -f "/etc/eks/containerd/containerd-config.toml" ]; then
-    ## this means we are building a gpu ami and have already placed a containerd configuration file in /etc/eks
-    echo "containerd config is already present"
-else 
-    sudo mv $TEMPLATE_DIR/containerd-config.toml /etc/eks/containerd/containerd-config.toml
-fi
-
-if [[ $KUBERNETES_VERSION == "1.22"* ]]; then
-    # enable CredentialProviders features in kubelet-containerd service file
-    IMAGE_CREDENTIAL_PROVIDER_FLAGS='\\\n    --image-credential-provider-config /etc/eks/ecr-credential-provider/ecr-credential-provider-config \\\n   --image-credential-provider-bin-dir /etc/eks/ecr-credential-provider'
-    sudo sed -i s,"aws","aws $IMAGE_CREDENTIAL_PROVIDER_FLAGS", $TEMPLATE_DIR/kubelet-containerd.service
-fi
-
-sudo mv $TEMPLATE_DIR/kubelet-containerd.service /etc/eks/containerd/kubelet-containerd.service
-sudo mv $TEMPLATE_DIR/sandbox-image.service /etc/eks/containerd/sandbox-image.service
-sudo mv $TEMPLATE_DIR/pull-sandbox-image.sh /etc/eks/containerd/pull-sandbox-image.sh
-sudo chmod +x /etc/eks/containerd/pull-sandbox-image.sh
-
-cat <<EOF | sudo tee -a /etc/modules-load.d/containerd.conf
-overlay
-br_netfilter
-EOF
-
-cat <<EOF | sudo tee -a /etc/sysctl.d/99-kubernetes-cri.conf
-net.bridge.bridge-nf-call-ip6tables = 1
-net.bridge.bridge-nf-call-iptables = 1
-net.ipv4.ip_forward = 1
-EOF
 
 
 ################################################################################
@@ -185,9 +57,7 @@ EOF
 # kubelet uses journald which has built-in rotation and capped size.
 # See man 5 journald.conf
 sudo mv $TEMPLATE_DIR/logrotate-kube-proxy /etc/logrotate.d/kube-proxy
-sudo mv $TEMPLATE_DIR/logrotate.conf /etc/logrotate.conf
 sudo chown root:root /etc/logrotate.d/kube-proxy
-sudo chown root:root /etc/logrotate.conf
 sudo mkdir -p /var/log/journal
 
 ################################################################################
@@ -216,15 +86,8 @@ BINARIES=(
     aws-iam-authenticator
 )
 for binary in ${BINARIES[*]} ; do
-    if [[ -n "$AWS_ACCESS_KEY_ID" ]]; then
-        echo "AWS cli present - using it to copy binaries from s3."
-        aws s3 cp --region $BINARY_BUCKET_REGION $S3_PATH/$binary .
-        aws s3 cp --region $BINARY_BUCKET_REGION $S3_PATH/$binary.sha256 .
-    else
-        echo "AWS cli missing - using wget to fetch binaries from s3. Note: This won't work for private bucket."
-        sudo wget $S3_URL_BASE/$binary
-        sudo wget $S3_URL_BASE/$binary.sha256
-    fi
+    sudo wget $S3_URL_BASE/$binary
+    sudo wget $S3_URL_BASE/$binary.sha256
     sudo sha256sum -c $binary.sha256
     sudo chmod +x $binary
     sudo mv $binary /usr/bin/
@@ -240,15 +103,8 @@ if [ "$PULL_CNI_FROM_GITHUB" = "true" ]; then
     sudo sha512sum -c "${CNI_PLUGIN_FILENAME}.tgz.sha512"
     rm "${CNI_PLUGIN_FILENAME}.tgz.sha512"
 else
-    if [[ -n "$AWS_ACCESS_KEY_ID" ]]; then
-        echo "AWS cli present - using it to copy binaries from s3."
-        aws s3 cp --region $BINARY_BUCKET_REGION $S3_PATH/${CNI_PLUGIN_FILENAME}.tgz .
-        aws s3 cp --region $BINARY_BUCKET_REGION $S3_PATH/${CNI_PLUGIN_FILENAME}.tgz.sha256 .
-    else
-        echo "AWS cli missing - using wget to fetch cni binaries from s3. Note: This won't work for private bucket."
-        sudo wget "$S3_URL_BASE/${CNI_PLUGIN_FILENAME}.tgz"
-        sudo wget "$S3_URL_BASE/${CNI_PLUGIN_FILENAME}.tgz.sha256"
-    fi
+    sudo wget "$S3_URL_BASE/${CNI_PLUGIN_FILENAME}.tgz"
+    sudo wget "$S3_URL_BASE/${CNI_PLUGIN_FILENAME}.tgz.sha256"
     sudo sha256sum -c "${CNI_PLUGIN_FILENAME}.tgz.sha256"
 fi
 sudo tar -xvf "${CNI_PLUGIN_FILENAME}.tgz" -C /opt/cni/bin
@@ -309,13 +165,7 @@ fi
 ################################################################################
 if [[ $KUBERNETES_VERSION == "1.22"* ]]; then
     ECR_BINARY="ecr-credential-provider"
-    if [[ -n "$AWS_ACCESS_KEY_ID" ]]; then
-        echo "AWS cli present - using it to copy ecr-credential-provider binaries from s3."
-        aws s3 cp --region $BINARY_BUCKET_REGION $S3_PATH/$ECR_BINARY .
-    else
-        echo "AWS cli missing - using wget to fetch ecr-credential-provider binaries from s3. Note: This won't work for private bucket."
-        sudo wget "$S3_URL_BASE/$ECR_BINARY"
-    fi
+    sudo wget "$S3_URL_BASE/$ECR_BINARY"
     sudo chmod +x $ECR_BINARY
     sudo mkdir -p /etc/eks/ecr-credential-provider
     sudo mv $ECR_BINARY /etc/eks/ecr-credential-provider
@@ -323,12 +173,6 @@ if [[ $KUBERNETES_VERSION == "1.22"* ]]; then
     # copying credential provider config file to eks folder
     sudo mv $TEMPLATE_DIR/ecr-credential-provider-config /etc/eks/ecr-credential-provider/ecr-credential-provider-config
 fi
-
-################################################################################
-### SSM Agent ##################################################################
-################################################################################
-
-sudo yum install -y amazon-ssm-agent
 
 ################################################################################
 ### AMI Metadata ###############################################################
@@ -348,52 +192,24 @@ sudo chown -R root:root /etc/eks
 ### Stuff required by "protectKernelDefaults=true" #############################
 ################################################################################
 
-cat <<EOF | sudo tee -a /etc/sysctl.d/99-amazon.conf
-vm.overcommit_memory=1
-kernel.panic=10
-kernel.panic_on_oops=1
-EOF
+#cat <<EOF | sudo tee -a /etc/sysctl.d/99-amazon.conf
+#vm.overcommit_memory=1
+#kernel.panic=10
+#kernel.panic_on_oops=1
+#EOF
 
 ################################################################################
 ### Setting up sysctl properties ###############################################
 ################################################################################
 
-echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
-echo fs.inotify.max_user_instances=8192 | sudo tee -a /etc/sysctl.conf
-echo vm.max_map_count=524288 | sudo tee -a /etc/sysctl.conf
+#echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
+#echo fs.inotify.max_user_instances=8192 | sudo tee -a /etc/sysctl.conf
+#echo vm.max_map_count=524288 | sudo tee -a /etc/sysctl.conf
 
 
 ################################################################################
 ### Cleanup ####################################################################
 ################################################################################
 
-CLEANUP_IMAGE="${CLEANUP_IMAGE:-true}"
-if [[ "$CLEANUP_IMAGE" == "true" ]]; then
-    # Clean up yum caches to reduce the image size
-    sudo yum clean all
-    sudo rm -rf \
-        $TEMPLATE_DIR  \
-        /var/cache/yum
-
-    # Clean up files to reduce confusion during debug
-    sudo rm -rf \
-        /etc/hostname \
-        /etc/machine-id \
-        /etc/resolv.conf \
-        /etc/ssh/ssh_host* \
-        /home/ec2-user/.ssh/authorized_keys \
-        /root/.ssh/authorized_keys \
-        /var/lib/cloud/data \
-        /var/lib/cloud/instance \
-        /var/lib/cloud/instances \
-        /var/lib/cloud/sem \
-        /var/lib/dhclient/* \
-        /var/lib/dhcp/dhclient.* \
-        /var/lib/yum/history \
-        /var/log/cloud-init-output.log \
-        /var/log/cloud-init.log \
-        /var/log/secure \
-        /var/log/wtmp
-fi
-
 sudo touch /etc/machine-id
+touch /tmp/eks-install-done

@@ -1,11 +1,13 @@
 [Unit]
 Description=Kubernetes Kubelet
 Documentation=https://github.com/kubernetes/kubernetes
-After=docker.service iptables-restore.service
-Requires=docker.service
+Before=graceful_k8s_shutdown.service
 
 [Service]
 ExecStartPre=/sbin/iptables -P FORWARD ACCEPT -w 5
+ExecStartPre=/bin/bash -c 'if [ "$(facter -p autoconfigure_k8s)" != true -a "$(facter -p baking_ami)" != true ]; then /nail/sys/bin/paasta_agent_healthcheck; fi'
+Environment="HOME=/root"
+EnvironmentFile=-/etc/default/kubelet
 ExecStart=/usr/bin/kubelet --cloud-provider aws \
     --config /etc/kubernetes/kubelet/kubelet-config.json \
     --kubeconfig /var/lib/kubelet/kubeconfig \
